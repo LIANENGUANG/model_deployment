@@ -1,0 +1,15 @@
+torch>=2.0.0
+transformers>=4.46.0
+fastapi>=0.100.0
+uvicorn>=0.20.0
+requests>=2.28.0
+pydantic>=2.0.0
+accelerate>=0.20.0
+bitsandbytes>=0.41.0
+triton>=3.4.0
+triton-kernels
+flash-attn>=2.5.0
+langchain>=0.1.0
+langchain-community>=0.0.10
+langchain-huggingface>=0.0.1
+aiohttp>=3.8.0

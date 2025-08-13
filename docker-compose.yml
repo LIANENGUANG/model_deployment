@@ -1,0 +1,17 @@
+version: '3'
+services:
+  model-server:
+    image: model_server:v3  # 使用新的v3镜像
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"  # 保持与远程服务器一致的端口配置
+    volumes:
+      - /data/lianenguang/data/bge-large-zh-v1.5:/app/models/bge-large-zh-v1.5:ro
+      - /data/lianenguang/data/bge-reranker-large:/app/models/bge-reranker-large:ro
+      - /data/lianenguang/data/gpt-oss-20b:/app/models/gpt-oss-20b:ro
+      - ./data:/app/data
+    environment:
+      - EMBEDDING_MODEL_PATH=/app/models/bge-large-zh-v1.5
+      - RERANKER_MODEL_PATH=/app/models/bge-reranker-large
+      - CHAT_MODEL_PATH=/app/models/gpt-oss-20b
+    restart: unless-stopped
