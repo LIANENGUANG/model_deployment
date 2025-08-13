@@ -13,10 +13,32 @@ import requests
 # 服务器地址
 BASE_URL = "http://10.7.65.71:8000"
 
+def test_root():
+    """测试根路径接口"""
+    response = requests.get(f"{BASE_URL}/")
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"Error: {response.status_code}, {response.text}")
+        return None
+
 def test_health():
     """测试服务健康状态"""
     response = requests.get(f"{BASE_URL}/health")
-    print("Health Check:", response.json())
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"Error: {response.status_code}, {response.text}")
+        return None
+
+def get_stats():
+    """获取服务器统计信息"""
+    response = requests.get(f"{BASE_URL}/stats")
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"Error: {response.status_code}, {response.text}")
+        return None
 
 def get_embeddings(texts):
     """获取文本嵌入向量"""
@@ -79,8 +101,23 @@ def chat_completion(messages, temperature=0.7, max_length=2048):
         return None
 
 if __name__ == "__main__":
+    # 测试根路径
+    print("Testing root endpoint...")
+    root_result = test_root()
+    if root_result:
+        print("Root Response:", root_result)
+    
     # 测试健康状态
-    test_health()
+    print("\nTesting health endpoint...")
+    health_result = test_health()
+    if health_result:
+        print("Health Check:", health_result)
+    
+    # 测试统计信息
+    print("\nTesting stats endpoint...")
+    stats_result = get_stats()
+    if stats_result:
+        print("Stats Response:", stats_result)
     
     # 测试文本嵌入
     texts = [
