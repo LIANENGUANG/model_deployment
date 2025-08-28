@@ -3,7 +3,7 @@ Author: LIANENGUANG lianenguang@gmail.com
 Date: 2025-08-11 11:55:55
 LastEditors: LIANENGUANG lianenguang@gmail.com
 LastEditTime: 2025-08-11 12:06:41
-Description: 简要描述此文件的作用
+Description: 从远程的服务器进行测试，本地是客户端，模型服务来资源远程
 FilePath: /models/client.py
 '''
 import json
@@ -100,6 +100,74 @@ def chat_completion(messages, temperature=0.7, max_length=2048):
         print(f"Error: {response.status_code}, {response.text}")
         return None
 
+def openai_chat_completion(messages, temperature=0.7, max_tokens=2048, stream=False):
+    """OpenAI兼容的聊天对话"""
+    payload = {
+        "model": "qwen3-30b-a3b-instruct-2507",
+        "messages": [{"role": msg["role"], "content": msg["content"]} for msg in messages],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": stream
+    }
+    
+    response = requests.post(
+        f"{BASE_URL}/v1/chat/completions",
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(payload),
+        stream=stream
+    )
+    
+    if response.status_code == 200:
+        if stream:
+            return response  # 返回流式响应对象
+        else:
+            return response.json()
+    else:
+        print(f"Error: {response.status_code}, {response.text}")
+        return None
+
+def test_stream_chat(messages):
+    """测试流式聊天输出"""
+    print("\n🌊 Testing stream chat...")
+    print("Query:", messages[-1]["content"])
+    print("Stream Response: ", end="", flush=True)
+    
+    response = openai_chat_completion(messages, stream=True)
+    if response:
+        full_content = ""
+        try:
+            for line in response.iter_lines(decode_unicode=True):
+                if not line or not line.strip():
+                    continue
+                    
+                if line.startswith("data: "):
+                    data_content = line[6:].strip()
+                    
+                    if data_content == "[DONE]":
+                        break
+                    
+                    try:
+                        chunk_data = json.loads(data_content)
+                        if 'choices' in chunk_data and chunk_data['choices']:
+                            delta = chunk_data['choices'][0].get('delta', {})
+                            if 'content' in delta:
+                                content = delta['content']
+                                print(content, end="", flush=True)
+                                full_content += content
+                    except json.JSONDecodeError:
+                        continue
+            
+            print("\n✅ Stream completed")
+            print(f"📝 Full response: {full_content}")
+            return full_content
+            
+        except Exception as e:
+            print(f"\n❌ Stream error: {e}")
+            return None
+    else:
+        print("❌ Failed to get stream response")
+        return None
+
 if __name__ == "__main__":
     # 测试根路径
     print("Testing root endpoint...")
@@ -175,3 +243,21 @@ if __name__ == "__main__":
         print(f"Message: {chat_result['message']}")
     else:
         print("Failed to get chat response")
+    
+    # 测试OpenAI格式非流式聊天
+    print("\nTesting OpenAI format chat...")
+    openai_result = openai_chat_completion(messages)
+    
+    if openai_result:
+        print("OpenAI Chat Response:")
+        print(f"Model: {openai_result['model']}")
+        print(f"Message: {openai_result['choices'][0]['message']['content']}")
+    else:
+        print("Failed to get OpenAI chat response")
+    
+    # 测试流式聊天对话
+    stream_messages = [
+        {"role": "user", "content": "请详细解释什么是深度学习，并举个例子。"}
+    ]
+    
+    stream_result = test_stream_chat(stream_messages)

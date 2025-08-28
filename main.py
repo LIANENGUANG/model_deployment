@@ -4,6 +4,7 @@ from typing import List
 import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.schema import AIMessage, HumanMessage, SystemMessage
 from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
@@ -14,10 +15,10 @@ from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 # 优先使用GPU，完全避免CPU计算
 print("🔧 正在配置GPU优化设置...")
 
-# 设置环境变量强制使用GPU
-# 设置环境变量，让Docker环境变量生效
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 注释掉硬编码，让Docker环境变量生效
+# 设置环境变量强制使用GPU和优化显存
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 使用第一块GPU
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # 避免tokenizer的CPU并行
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"  # 减少显存碎片
 
 # 极度限制CPU线程使用，强制使用GPU
 torch.set_num_threads(1)
@@ -51,21 +52,10 @@ else:
 
 app = FastAPI(title="BGE Model Service")
 
-# 添加CORS中间件以允许跨域访问
-from fastapi.middleware.cors import CORSMiddleware
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 允许所有来源（生产环境中应该限制具体域名）
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # 模型路径
 EMBEDDING_MODEL_PATH = os.getenv("EMBEDDING_MODEL_PATH", "/app/models/bge-large-zh-v1.5")
 RERANKER_MODEL_PATH = os.getenv("RERANKER_MODEL_PATH", "/app/models/bge-reranker-large")
-CHAT_MODEL_PATH = os.getenv("CHAT_MODEL_PATH", "/app/models/gpt-oss-20b")
+CHAT_MODEL_PATH = os.getenv("CHAT_MODEL_PATH", "/app/models/qwen3-30b-a3b-instruct-2507")
 
 # 设备常量
 CUDA_DEVICE = "cuda:0"
@@ -202,6 +192,36 @@ class ChatRequest(BaseModel):
     temperature: float = 0.7
     do_sample: bool = True
 
+# OpenAI 兼容的请求响应模型
+class OpenAIMessage(BaseModel):
+    role: str  # "system", "user", "assistant"
+    content: str
+
+class OpenAIChatRequest(BaseModel):
+    model: str = "qwen3-30b-a3b-instruct-2507"
+    messages: List[OpenAIMessage]
+    max_tokens: int = 2048
+    temperature: float = 0.7
+    stream: bool = False
+
+class OpenAIChoice(BaseModel):
+    message: OpenAIMessage
+    finish_reason: str = "stop"
+    index: int = 0
+
+class OpenAIUsage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+class OpenAIChatResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: List[OpenAIChoice]
+    usage: OpenAIUsage
+
 class ChatResponse(BaseModel):
     message: str
     model: str
@@ -259,8 +279,8 @@ def _load_chat():
         
         # 根据显存大小选择策略
         if gpu_memory_gb >= 24:  # 24GB以上显存
-            device_map = {"": 0}  # 全部放在GPU 0
-            print("📍 策略: 所有层放在GPU 0")
+            device_map = "auto"  # 使用auto让accelerate智能分配
+            print("📍 策略: 智能自动分配到GPU")
         elif gpu_memory_gb >= 12:  # 12-24GB显存
             device_map = "auto"  # 自动分配但优先GPU
             print("📍 策略: 自动分配，优先GPU")
@@ -279,14 +299,27 @@ def _load_chat():
     start_time = time.time()
     
     try:
-        # 使用accelerate的自动设备映射
+        # 使用accelerate的自动设备映射，优化显存使用
         print("⏳ 正在实例化模型...")
+        
+        # 清理GPU缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print("🧹 清理GPU缓存")
+        
         chat_model = AutoModelForCausalLM.from_pretrained(
             CHAT_MODEL_PATH,
             trust_remote_code=True,
             low_cpu_mem_usage=True,
-            torch_dtype=torch.bfloat16,  # 明确指定数据类型
-            device_map="auto"  # 让accelerate自动管理设备映射
+            torch_dtype=torch.bfloat16,  # 使用bfloat16
+            device_map=device_map,
+            load_in_4bit=True,  # 启用4bit量化
+            bnb_4bit_compute_dtype=torch.bfloat16,  # 4bit计算时使用的数据类型
+            bnb_4bit_use_double_quant=True,  # 启用双重量化
+            bnb_4bit_quant_type="nf4",  # 使用NF4量化类型
+            max_memory={0: f"{int(gpu_memory_gb * 0.8)}GB"} if torch.cuda.is_available() else None,  # 可以用更多显存
+            offload_folder=None,  # 禁用磁盘offload
+            offload_state_dict=False  # 禁用状态字典offload
         )
         
         end_time = time.time()
@@ -446,8 +479,8 @@ async def load_models():
     os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
     
     app.state.chat_config = {
-        "quant": "mxfp4",
-        "resolved_dtype": "native",
+        "quant": "nf4",  # 使用NF4 4bit量化
+        "resolved_dtype": "bfloat16",
         "max_new_tokens_default": int(os.getenv("MAX_NEW_TOKENS", "512"))
     }
     
@@ -662,6 +695,98 @@ def _generate_with_model(model, tokenizer, input_ids, attention_mask, max_new_to
             )
     return outputs
 
+def _stream_generate_with_model(model, tokenizer, input_ids, attention_mask, max_new_tokens, temperature, do_sample, device):
+    """优化的流式生成文本 - 使用transformers内置的流式生成"""
+    import json
+    import time
+    import uuid
+    from transformers import TextIteratorStreamer
+    import threading
+
+    # 创建响应ID
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created_time = int(time.time())
+    
+    try:
+        # 使用TextIteratorStreamer进行流式生成
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        
+        # 生成参数
+        generation_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "do_sample": do_sample,
+            "pad_token_id": tokenizer.eos_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+            "use_cache": True,
+            "streamer": streamer,
+        }
+        
+        # 在单独线程中启动生成
+        def generate():
+            with torch.no_grad():
+                if torch.cuda.is_available() and device.type == "cuda":
+                    with torch.cuda.amp.autocast():
+                        model.generate(**generation_kwargs)
+                else:
+                    model.generate(**generation_kwargs)
+        
+        generation_thread = threading.Thread(target=generate)
+        generation_thread.start()
+        
+        # 流式输出每个生成的文本片段
+        for new_text in streamer:
+            if new_text:  # 确保不是空字符串
+                chunk = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": "qwen3-30b-a3b-instruct-2507",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": new_text},
+                        "finish_reason": None
+                    }]
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+        
+        # 等待生成线程完成
+        generation_thread.join()
+        
+        # 发送结束chunk
+        final_chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": "qwen3-30b-a3b-instruct-2507",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop"
+            }]
+        }
+        yield f"data: {json.dumps(final_chunk)}\n\n"
+        
+    except Exception as e:
+        # 发送错误信息
+        error_chunk = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created_time,
+            "model": "qwen3-30b-a3b-instruct-2507",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": f"[ERROR: {str(e)}]"},
+                "finish_reason": "error"
+            }]
+        }
+        yield f"data: {json.dumps(error_chunk)}\n\n"
+    
+    # 发送结束标记
+    yield "data: [DONE]\n\n"
+
 def _chat_with_langchain(messages: List[dict]):
     """使用 LangChain 进行聊天推理"""
     if langchain_chat_model is None or chat_prompt_template is None:
@@ -690,11 +815,25 @@ def _chat_with_langchain(messages: List[dict]):
         # 使用 LangChain 生成回复
         response = langchain_chat_model.invoke(formatted_prompt)
         
-        # 提取回复内容
+        # 提取并清理回复内容
         if hasattr(response, 'content'):
-            return response.content.strip()
+            content = response.content.strip()
         else:
-            return str(response).strip()
+            content = str(response).strip()
+        
+        # 清理Qwen3模板标记
+        content = content.replace("<|im_end|>", "").strip()
+        content = content.replace("<|im_start|>assistant", "").strip()
+        content = content.replace("<|im_start|>system", "").strip()
+        content = content.replace("<|im_start|>user", "").strip()
+        
+        # 如果包含assistant标记，提取assistant后的内容
+        if '<|im_start|>assistant' in content:
+            parts = content.split('<|im_start|>assistant')
+            if len(parts) > 1:
+                content = parts[-1].replace('<|im_end|>', '').strip()
+        
+        return content
             
     except Exception as e:
         print(f"❌ LangChain 推理失败: {e}")
@@ -727,17 +866,23 @@ async def chat_completion(request: ChatRequest):
         
         # 回退到原生模式
         print("🔧 使用原生模式推理")
-        # 构建对话prompt
+        
+        # 构建Qwen3格式的对话
         conversation = ""
         for message in request.messages:
             role = message["role"]
             content = message["content"]
-            if role == "user":
-                conversation += f"User: {content}\n"
+            
+            if role == "system":
+                conversation += f"<|im_start|>system\n{content}<|im_end|>\n"
+            elif role == "user":
+                conversation += f"<|im_start|>user\n{content}<|im_end|>\n"
             elif role == "assistant":
-                conversation += f"Assistant: {content}\n"
+                conversation += f"<|im_start|>assistant\n{content}<|im_end|>\n"
         
-        conversation += "Assistant: "
+        # 添加assistant开始标记
+        conversation += "<|im_start|>assistant\n"
+        
         print(f"📝 对话上下文长度: {len(conversation)} 字符")
         
         # 编码输入 - 强制使用GPU友好的设置
@@ -788,6 +933,10 @@ async def chat_completion(request: ChatRequest):
         response = chat_tokenizer.decode(outputs[0], skip_special_tokens=True)
         assistant_response = response[len(conversation):]
         
+        # 清理Qwen3特殊标记
+        assistant_response = assistant_response.replace("<|im_end|>", "").strip()
+        assistant_response = assistant_response.replace("<|im_start|>assistant", "").strip()
+        
         # 计算生成的token数
         generated_tokens = outputs[0].shape[0] - input_ids.shape[1]
         print(f"📊 生成Token数: {generated_tokens}")
@@ -811,6 +960,128 @@ async def chat_completion(request: ChatRequest):
             print("🧹 已清理GPU缓存")
         raise HTTPException(status_code=500, detail=f"Error processing chat request: {str(e)}")
 
+@app.post("/v1/chat/completions")
+async def openai_chat_completion(request: OpenAIChatRequest):
+    """OpenAI兼容的聊天完成API - 支持流式和非流式"""
+    if chat_model is None or chat_tokenizer is None:
+        raise HTTPException(status_code=500, detail="Chat model not loaded")
+    
+    try:
+        # 转换OpenAI格式到内部格式
+        internal_messages = []
+        for msg in request.messages:
+            internal_messages.append({
+                "role": msg.role,
+                "content": msg.content
+            })
+        
+        # 构建Qwen3格式的对话
+        conversation = ""
+        for message in internal_messages:
+            role = message["role"]
+            content = message["content"]
+            
+            if role == "system":
+                conversation += f"<|im_start|>system\n{content}<|im_end|>\n"
+            elif role == "user":
+                conversation += f"<|im_start|>user\n{content}<|im_end|>\n"
+            elif role == "assistant":
+                conversation += f"<|im_start|>assistant\n{content}<|im_end|>\n"
+        
+        # 添加assistant开始标记
+        conversation += "<|im_start|>assistant\n"
+        
+        # 编码输入
+        encoded = chat_tokenizer(
+            conversation,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=4096
+        )
+        
+        # 获取设备并移动数据
+        device = _get_model_device(chat_model)
+        input_ids = encoded["input_ids"].to(device, non_blocking=True)
+        attention_mask = encoded["attention_mask"].to(device, non_blocking=True)
+        
+        # 根据stream参数选择流式或非流式
+        if request.stream:
+            # 流式响应
+            def generate_stream():
+                try:
+                    for chunk in _stream_generate_with_model(
+                        chat_model, chat_tokenizer, input_ids, attention_mask,
+                        request.max_tokens, request.temperature, True, device
+                    ):
+                        yield chunk
+                except Exception as e:
+                    print(f"❌ 流式生成错误: {e}")
+                    yield f"data: {{'error': '{str(e)}'}}\n\n"
+            
+            return StreamingResponse(
+                generate_stream(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Access-Control-Allow-Origin": "*"
+                }
+            )
+        else:
+            # 非流式响应
+            outputs = _generate_with_model(
+                chat_model, chat_tokenizer, input_ids, attention_mask,
+                request.max_tokens, request.temperature, True, device
+            )
+            
+            # 解码输出
+            response = chat_tokenizer.decode(outputs[0], skip_special_tokens=True)
+            assistant_response = response[len(conversation):]
+            
+            # 清理Qwen3特殊标记
+            assistant_response = assistant_response.replace("<|im_end|>", "").strip()
+            assistant_response = assistant_response.replace("<|im_start|>assistant", "").strip()
+            
+            # 计算token数量
+            input_tokens = len(chat_tokenizer.encode(conversation))
+            output_tokens = len(chat_tokenizer.encode(assistant_response))
+            
+            # 生成响应ID和时间戳
+            import time
+            import uuid
+            
+            response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+            created_time = int(time.time())
+            
+            # 返回OpenAI格式响应
+            return OpenAIChatResponse(
+                id=response_id,
+                created=created_time,
+                model=request.model,
+                choices=[
+                    OpenAIChoice(
+                        message=OpenAIMessage(
+                            role="assistant",
+                            content=assistant_response
+                        ),
+                        finish_reason="stop",
+                        index=0
+                    )
+                ],
+                usage=OpenAIUsage(
+                    prompt_tokens=input_tokens,
+                    completion_tokens=output_tokens,
+                    total_tokens=input_tokens + output_tokens
+                )
+            )
+        
+    except Exception as e:
+        print(f"❌ OpenAI兼容API调用失败: {e}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        raise HTTPException(status_code=500, detail=f"Error processing OpenAI chat request: {str(e)}")
+
 if __name__ == "__main__":
     print("🌟 启动BGE模型服务器")
     print("🎮 GPU检查:")
@@ -819,8 +1090,8 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         app, 
-        host="0.0.0.0",  # 确保绑定到所有网络接口，允许外部访问
-        port=8000,       # Docker容器内部使用8000端口
+        host="0.0.0.0", 
+        port=8000,
         log_level="info",
         access_log=True
     )
