@@ -5,9 +5,6 @@ import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.schema import AIMessage, HumanMessage, SystemMessage
-from langchain_huggingface import ChatHuggingFace, HuggingFacePipeline
 from pydantic import BaseModel
 
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
@@ -69,10 +66,8 @@ reranker_model = None
 chat_tokenizer = None
 chat_model = None
 
-# LangChain 相关变量
-langchain_llm = None
-langchain_chat_model = None
-chat_prompt_template = None
+# KV缓存存储 - 简单dict即可
+kv_cache = {}
 
 # 性能优化常量
 QWEN_TEMPLATE_CONSTANTS = {
@@ -137,11 +132,6 @@ class RerankRequest(BaseModel):
 class RerankResponse(BaseModel):
     scores: List[float]
 
-class ChatRequest(BaseModel):
-    messages: List[dict]  # [{"role": "user", "content": "..."}]
-    max_length: int = 2048
-    temperature: float = 0.7
-    do_sample: bool = True
 
 # OpenAI 兼容的请求响应模型
 class OpenAIMessage(BaseModel):
@@ -173,9 +163,6 @@ class OpenAIChatResponse(BaseModel):
     choices: List[OpenAIChoice]
     usage: OpenAIUsage
 
-class ChatResponse(BaseModel):
-    message: str
-    model: str
 
 def _load_embedding():
     global embedding_tokenizer, embedding_model
@@ -298,48 +285,6 @@ def _load_chat():
         print(f"   设备映射检查失败: {e}")
     
     print("✅ Chat模型基础加载完成 (NF4量化)")
-    
-    # 集成 LangChain
-    print("🔗 正在集成 LangChain...")
-    try:
-        # 使用正确的 HuggingFacePipeline 初始化方式
-        from transformers import pipeline
-
-        # 创建 transformers pipeline
-        hf_pipeline = pipeline(
-            "text-generation",
-            model=chat_model,
-            tokenizer=chat_tokenizer,
-            # 不指定device参数，因为模型已通过accelerate管理设备
-            model_kwargs={
-                "temperature": 0.3,
-                "max_new_tokens": 512,
-                "do_sample": True,
-                "pad_token_id": chat_tokenizer.eos_token_id,
-                "eos_token_id": chat_tokenizer.eos_token_id,
-            }
-        )
-        
-        # 创建 LangChain Pipeline
-        langchain_llm = HuggingFacePipeline(pipeline=hf_pipeline)
-        
-        # 创建 Chat 模型
-        langchain_chat_model = ChatHuggingFace(llm=langchain_llm, verbose=False)
-        
-        # 创建对话模板
-        chat_prompt_template = ChatPromptTemplate.from_messages([
-            ("system", "你是一个有用的AI助手。请简洁、准确地回答用户的问题，不要包含任何多余的内容或解释。"),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}")
-        ])
-        
-        print("✅ LangChain 集成完成")
-        
-    except Exception as e:
-        print(f"⚠️ LangChain 集成失败: {e}")
-        langchain_llm = None
-        langchain_chat_model = None
-        chat_prompt_template = None
 
 def _maybe_warmup():
     if os.getenv("CHAT_WARMUP", "0") != "1":
@@ -575,46 +520,30 @@ def _get_model_device(model):
         device = torch.device("cpu")
     return device
 
-def _generate_with_model(model, tokenizer, input_ids, attention_mask, max_new_tokens, temperature, do_sample, device):
+def _generate_with_model(model, tokenizer, input_ids, attention_mask, max_new_tokens, temperature, past_key_values=None):
     """使用模型生成文本"""
     with torch.no_grad():
-        if torch.cuda.is_available() and device.type == "cuda":
-            with torch.amp.autocast('cuda'):
-                outputs = model.generate(
-                    input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    do_sample=do_sample,
-                    pad_token_id=tokenizer.eos_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    use_cache=True,
-                    num_beams=1,
-                    early_stopping=True
-                )
-        else:
+        with torch.amp.autocast('cuda'):
             outputs = model.generate(
                 input_ids,
                 attention_mask=attention_mask,
+                past_key_values=past_key_values,
                 max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=do_sample,
+                temperature=temperature if temperature > 0.1 else 0.1,
+                do_sample=temperature > 0.1,
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 use_cache=True,
                 num_beams=1,
-                repetition_penalty=1.0,  # 禁用重复惩罚
-                length_penalty=1.0,  # 禁用长度惩罚
-                early_stopping=True,
-                # 极速优化参数
-                top_k=20 if do_sample else None,
-                top_p=0.9 if do_sample else None,
+                top_k=10 if temperature > 0.1 else None,
+                top_p=0.85 if temperature > 0.1 else None,
                 output_attentions=False,
-                output_hidden_states=False
+                output_hidden_states=False,
+                return_dict_in_generate=True
             )
     return outputs
 
-def _stream_generate_with_model(model, tokenizer, input_ids, attention_mask, max_new_tokens, temperature, do_sample, device):
+def _stream_generate_with_model(model, tokenizer, input_ids, attention_mask, max_new_tokens, temperature, past_key_values=None):
     """优化的流式生成文本 - 使用transformers内置的流式生成"""
     import json
     import time
@@ -630,55 +559,69 @@ def _stream_generate_with_model(model, tokenizer, input_ids, attention_mask, max
         # 使用TextIteratorStreamer进行流式生成
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
         
-        # 极速优化的生成参数
+        # 高性能生成参数
         generation_kwargs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
+            "past_key_values": past_key_values,
             "max_new_tokens": max_new_tokens,
-            "temperature": temperature,
-            "do_sample": do_sample,
+            "temperature": temperature if temperature > 0.1 else 0.1,
+            "do_sample": temperature > 0.1,
             "pad_token_id": tokenizer.eos_token_id,
             "eos_token_id": tokenizer.eos_token_id,
             "use_cache": True,
             "streamer": streamer,
-            # 极速性能优化参数
-            "num_beams": 1,  # 禁用beam search
-            "repetition_penalty": 1.0,  # 禁用重复惩罚
-            "length_penalty": 1.0,  # 禁用长度惩罚
-            "early_stopping": False,  # 流式生成时禁用提前停止
-            "top_k": 20 if do_sample else None,  # 限制采样范围加速
-            "top_p": 0.9 if do_sample else None,  # 核采样加速
-            "output_attentions": False,  # 禁用注意力权重输出
-            "output_hidden_states": False,  # 禁用隐藏状态输出
+            "num_beams": 1,
+            "top_k": 10 if temperature > 0.1 else None,
+            "top_p": 0.85 if temperature > 0.1 else None,
+            "output_attentions": False,
+            "output_hidden_states": False,
+            "output_scores": False,
         }
         
-        # 在单独线程中启动生成 - 简化版本专注性能
+        # 在单独线程中启动生成
         def generate():
             with torch.no_grad():
-                if torch.cuda.is_available() and device.type == "cuda":
-                    with torch.amp.autocast('cuda', dtype=torch.float16):  # 明确指定float16
-                        model.generate(**generation_kwargs)
-                else:
+                with torch.amp.autocast('cuda'):
                     model.generate(**generation_kwargs)
         
         generation_thread = threading.Thread(target=generate)
         generation_thread.start()
         
-        # 流式输出每个生成的文本片段
+        # 批量文本发送优化
+        text_buffer = []
         for new_text in streamer:
-            if new_text:  # 确保不是空字符串
-                chunk = {
-                    "id": response_id,
-                    "object": CHAT_COMPLETION_CHUNK,
-                    "created": created_time,
-                    "model": "qwen3-30b-a3b-instruct-2507",
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": new_text},
-                        "finish_reason": None
-                    }]
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
+            if new_text:
+                text_buffer.append(new_text)
+                if len(text_buffer) >= 3:  # 每3个token批量发送
+                    chunk = {
+                        "id": response_id,
+                        "object": CHAT_COMPLETION_CHUNK,
+                        "created": created_time,
+                        "model": "qwen3-30b-a3b-instruct-2507",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": ''.join(text_buffer)},
+                            "finish_reason": None
+                        }]
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                    text_buffer = []
+        
+        # 发送剩余文本
+        if text_buffer:
+            chunk = {
+                "id": response_id,
+                "object": CHAT_COMPLETION_CHUNK,
+                "created": created_time,
+                "model": "qwen3-30b-a3b-instruct-2507",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": ''.join(text_buffer)},
+                    "finish_reason": None
+                }]
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
         
         # 等待生成线程完成
         generation_thread.join()
@@ -715,139 +658,7 @@ def _stream_generate_with_model(model, tokenizer, input_ids, attention_mask, max
     # 发送结束标记
     yield "data: [DONE]\n\n"
 
-def _chat_with_langchain(messages: List[dict]):
-    """使用 LangChain 进行聊天推理"""
-    if langchain_chat_model is None or chat_prompt_template is None:
-        return None
-    
-    try:
-        # 转换消息格式
-        chat_history = []
-        current_input = ""
-        
-        for msg in messages:
-            if msg["role"] == "user":
-                current_input = msg["content"]  # 最后一个用户输入
-            elif msg["role"] == "assistant":
-                if current_input:  # 如果有之前的用户输入
-                    chat_history.append(HumanMessage(content=current_input))
-                    current_input = ""
-                chat_history.append(AIMessage(content=msg["content"]))
-        
-        # 构建prompt
-        formatted_prompt = chat_prompt_template.format_messages(
-            chat_history=chat_history,
-            input=current_input
-        )
-        
-        # 使用 LangChain 生成回复
-        response = langchain_chat_model.invoke(formatted_prompt)
-        
-        # 提取并清理回复内容
-        if hasattr(response, 'content'):
-            content = response.content.strip()
-        else:
-            content = str(response).strip()
-        
-        # 清理Qwen3模板标记 - 使用常量提升性能
-        content = content.replace(QWEN_TEMPLATE_CONSTANTS["IM_END"], "").strip()
-        content = content.replace(QWEN_TEMPLATE_CONSTANTS["IM_START_ASSISTANT"], "").strip()
-        content = content.replace(QWEN_TEMPLATE_CONSTANTS["IM_START_SYSTEM"], "").strip()
-        content = content.replace(QWEN_TEMPLATE_CONSTANTS["IM_START_USER"], "").strip()
-        
-        # 如果包含assistant标记，提取assistant后的内容
-        if QWEN_TEMPLATE_CONSTANTS["IM_START_ASSISTANT"] in content:
-            parts = content.split(QWEN_TEMPLATE_CONSTANTS["IM_START_ASSISTANT"])
-            if len(parts) > 1:
-                content = parts[-1].replace(QWEN_TEMPLATE_CONSTANTS["IM_END"], '').strip()
-        
-        return content
-            
-    except Exception as e:
-        print(f"❌ LangChain 推理失败: {e}")
-        return None
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat_completion(request: ChatRequest):
-    if chat_model is None or chat_tokenizer is None:
-        raise HTTPException(status_code=500, detail="Chat model not loaded")
-    
-    print(f"🚀 Chat推理: {len(request.messages)} 条消息")
-    
-    try:
-        # 使用 LangChain 模式推理
-        if langchain_chat_model is not None:
-            print("🔗 使用 LangChain 模式推理")
-            assistant_response = _chat_with_langchain(request.messages)
-            
-            if assistant_response:
-                print("✅ LangChain 推理完成")
-                return ChatResponse(
-                    message=assistant_response,
-                    model=CHAT_MODEL_PATH.split("/")[-1] + " (LangChain)"
-                )
-        
-        # 使用原生模式推理
-        print("🔧 使用原生模式推理")
-        
-        # 构建Qwen3格式的对话
-        conversation = ""
-        for message in request.messages:
-            role = message["role"]
-            content = message["content"]
-            
-            if role == "system":
-                conversation += f"{QWEN_TEMPLATE_CONSTANTS['IM_START_SYSTEM']}\n{content}{QWEN_TEMPLATE_CONSTANTS['IM_END']}\n"
-            elif role == "user":
-                conversation += f"{QWEN_TEMPLATE_CONSTANTS['IM_START_USER']}\n{content}{QWEN_TEMPLATE_CONSTANTS['IM_END']}\n"
-            elif role == "assistant":
-                conversation += f"{QWEN_TEMPLATE_CONSTANTS['IM_START_ASSISTANT']}\n{content}{QWEN_TEMPLATE_CONSTANTS['IM_END']}\n"
-        
-        # 添加assistant开始标记
-        conversation += f"{QWEN_TEMPLATE_CONSTANTS['IM_START_ASSISTANT']}\n"
-        
-        # 编码输入
-        encoded = chat_tokenizer(
-            conversation,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=4096
-        )
-        
-        # 获取设备并移动数据
-        device = _get_model_device(chat_model)
-        input_ids = encoded["input_ids"].to(device, non_blocking=True)
-        attention_mask = encoded["attention_mask"].to(device, non_blocking=True)
-        
-        # 生成回复
-        max_new_tokens = min(request.max_length, getattr(app.state, 'chat_config', {}).get('max_new_tokens_default', request.max_length))
-            
-        outputs = _generate_with_model(
-            chat_model, chat_tokenizer, input_ids, attention_mask,
-            max_new_tokens, request.temperature, request.do_sample, device
-        )
-        
-        # 解码输出
-        response = chat_tokenizer.decode(outputs[0], skip_special_tokens=True)
-        assistant_response = response[len(conversation):]
-        
-        # 清理Qwen3特殊标记
-        assistant_response = assistant_response.replace(QWEN_TEMPLATE_CONSTANTS["IM_END"], "").strip()
-        assistant_response = assistant_response.replace(QWEN_TEMPLATE_CONSTANTS["IM_START_ASSISTANT"], "").strip()
-        
-        print("✅ Chat推理完成")
-        
-        return ChatResponse(
-            message=assistant_response.strip(),
-            model=CHAT_MODEL_PATH.split("/")[-1]
-        )
-    
-    except Exception as e:
-        print(f"❌ Chat推理失败: {str(e)}")
-        torch.cuda.empty_cache()
-        print("🧹 已清理GPU缓存")
-        raise HTTPException(status_code=500, detail=f"Error processing chat request: {str(e)}")
 
 @app.post("/v1/chat/completions")
 async def openai_chat_completion(request: OpenAIChatRequest):
@@ -864,8 +675,16 @@ async def openai_chat_completion(request: OpenAIChatRequest):
                 "content": msg.content
             })
         
-        # 构建Qwen3格式的对话
+        # KV缓存优化
         conversation = ""
+        cache_key = None
+        past_key_values = None
+        
+        if len(internal_messages) > 1:
+            history_text = str(internal_messages[:-1])
+            cache_key = hash(history_text) % 1000000
+            past_key_values = kv_cache.get(cache_key)
+        
         for message in internal_messages:
             role = message["role"]
             content = message["content"]
@@ -901,7 +720,7 @@ async def openai_chat_completion(request: OpenAIChatRequest):
                 try:
                     for chunk in _stream_generate_with_model(
                         chat_model, chat_tokenizer, input_ids, attention_mask,
-                        request.max_tokens, request.temperature, True, device
+                        request.max_tokens, request.temperature, past_key_values
                     ):
                         yield chunk
                 except Exception as e:
@@ -921,12 +740,16 @@ async def openai_chat_completion(request: OpenAIChatRequest):
             # 非流式响应
             outputs = _generate_with_model(
                 chat_model, chat_tokenizer, input_ids, attention_mask,
-                request.max_tokens, request.temperature, True, device
+                request.max_tokens, request.temperature, past_key_values
             )
             
             # 解码输出
-            response = chat_tokenizer.decode(outputs[0], skip_special_tokens=True)
+            response = chat_tokenizer.decode(outputs.sequences[0], skip_special_tokens=True)
             assistant_response = response[len(conversation):]
+            
+            # 更新KV缓存
+            if cache_key is not None and hasattr(outputs, 'past_key_values') and len(kv_cache) < 20:
+                kv_cache[cache_key] = outputs.past_key_values
             
             # 清理Qwen3特殊标记
             assistant_response = assistant_response.replace("<|im_end|>", "").strip()

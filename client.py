@@ -79,29 +79,9 @@ def rerank_documents(query, documents):
         print(f"Error: {response.status_code}, {response.text}")
         return None
 
-def chat_completion(messages, temperature=0.7, max_length=2048):
-    """聊天对话"""
-    payload = {
-        "messages": messages,
-        "temperature": temperature,
-        "max_length": max_length,
-        "do_sample": True
-    }
-    
-    response = requests.post(
-        f"{BASE_URL}/chat",
-        headers={"Content-Type": "application/json"},
-        data=json.dumps(payload)
-    )
-    
-    if response.status_code == 200:
-        return response.json()
-    else:
-        print(f"Error: {response.status_code}, {response.text}")
-        return None
 
-def openai_chat_completion(messages, temperature=0.7, max_tokens=2048, stream=False):
-    """OpenAI兼容的聊天对话"""
+def chat_completion(messages, temperature=0.7, max_tokens=2048, stream=False):
+    """聊天对话 - OpenAI兼容格式"""
     payload = {
         "model": "qwen3-30b-a3b-instruct-2507",
         "messages": [{"role": msg["role"], "content": msg["content"]} for msg in messages],
@@ -132,7 +112,7 @@ def test_stream_chat(messages):
     print("Query:", messages[-1]["content"])
     print("Stream Response: ", end="", flush=True)
     
-    response = openai_chat_completion(messages, stream=True)
+    response = chat_completion(messages, stream=True)
     if response:
         full_content = ""
         try:
@@ -240,20 +220,9 @@ if __name__ == "__main__":
     if chat_result:
         print("Chat Response:")
         print(f"Model: {chat_result['model']}")
-        print(f"Message: {chat_result['message']}")
+        print(f"Message: {chat_result['choices'][0]['message']['content']}")
     else:
         print("Failed to get chat response")
-    
-    # 测试OpenAI格式非流式聊天
-    print("\nTesting OpenAI format chat...")
-    openai_result = openai_chat_completion(messages)
-    
-    if openai_result:
-        print("OpenAI Chat Response:")
-        print(f"Model: {openai_result['model']}")
-        print(f"Message: {openai_result['choices'][0]['message']['content']}")
-    else:
-        print("Failed to get OpenAI chat response")
     
     # 测试流式聊天对话
     stream_messages = [
