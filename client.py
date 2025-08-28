@@ -80,13 +80,12 @@ def rerank_documents(query, documents):
         return None
 
 
-def chat_completion(messages, temperature=0.7, max_tokens=2048, stream=False):
-    """聊天对话 - OpenAI兼容格式"""
+def chat_completion(messages, max_tokens=2048, stream=False):
+    """聊天对话 - OpenAI兼容格式，业务场景确定性结果"""
     payload = {
         "model": "qwen3-30b-a3b-instruct-2507",
         "messages": [{"role": msg["role"], "content": msg["content"]} for msg in messages],
         "max_tokens": max_tokens,
-        "temperature": temperature,
         "stream": stream
     }
     

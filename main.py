@@ -1,4 +1,5 @@
 import os
+from asyncio import Semaphore
 from typing import List
 
 import numpy as np
@@ -9,43 +10,20 @@ from pydantic import BaseModel
 
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
-# 优先使用GPU，完全避免CPU计算
-print("🔧 正在配置GPU优化设置...")
+# GPU优化设置
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-# 设置环境变量强制使用GPU和优化显存
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 使用第一块GPU
-os.environ["TOKENIZERS_PARALLELISM"] = "false"  # 避免tokenizer的CPU并行
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"  # 减少显存碎片
-
-# 极度限制CPU线程使用，强制使用GPU
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
 
-# 检查GPU可用性并打印详细信息
-if torch.cuda.is_available():
-    gpu_count = torch.cuda.device_count()
-    current_gpu = torch.cuda.current_device()
-    gpu_name = torch.cuda.get_device_name(current_gpu)
-    gpu_memory = torch.cuda.get_device_properties(current_gpu).total_memory / (1024**3)
-    
-    print("🎮 GPU设备信息:")
-    print(f"   - 可用GPU数量: {gpu_count}")
-    print(f"   - 当前使用GPU: {current_gpu}")
-    print(f"   - GPU名称: {gpu_name}")
-    print(f"   - GPU总显存: {gpu_memory:.2f} GB")
-    
-    # 启用所有GPU优化选项
-    torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = True  # 优化卷积操作
-    torch.backends.cuda.matmul.allow_tf32 = True  # 允许TF32
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
-    
-    # 设置GPU内存策略
-    torch.cuda.empty_cache()  # 清空缓存
-    print("✅ GPU优化设置完成")
-else:
-    print("❌ 警告: 未检测到CUDA GPU，将使用CPU（性能会很差）")
+print(f"🚀 GPU: {torch.cuda.get_device_name(0)}, {torch.cuda.get_device_properties(0).total_memory / (1024**3):.1f}GB")
 
 app = FastAPI(title="BGE Model Service")
 
@@ -54,9 +32,8 @@ EMBEDDING_MODEL_PATH = os.getenv("EMBEDDING_MODEL_PATH", "/app/models/bge-large-
 RERANKER_MODEL_PATH = os.getenv("RERANKER_MODEL_PATH", "/app/models/bge-reranker-large")
 CHAT_MODEL_PATH = os.getenv("CHAT_MODEL_PATH", "/app/models/qwen3-30b-a3b-instruct-2507")
 
-# 设备常量
+# 设备常量 - H100专用
 CUDA_DEVICE = "cuda:0"
-DEFAULT_DEVICE = CUDA_DEVICE if torch.cuda.is_available() else "cpu"
 
 # 全局变量存储模型和tokenizer
 embedding_tokenizer = None
@@ -97,23 +74,6 @@ def _get_attention_config():
         print(f"⚠️  Flash Attention 检查失败: {e}，使用默认实现")
         return {}
 
-def _print_gpu_status():
-    """打印详细的GPU使用状态"""
-    if not torch.cuda.is_available():
-        print("❌ GPU不可用，使用CPU")
-        return
-    
-    for i in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(i)
-        allocated = torch.cuda.memory_allocated(i) / (1024**3)
-        reserved = torch.cuda.memory_reserved(i) / (1024**3)
-        total = props.total_memory / (1024**3)
-        
-        print(f"📊 GPU {i} ({props.name}):")
-        print(f"   - 已分配显存: {allocated:.2f} GB")
-        print(f"   - 已保留显存: {reserved:.2f} GB") 
-        print(f"   - 总显存: {total:.2f} GB")
-        print(f"   - 显存使用率: {(allocated/total)*100:.1f}%")
 
 
 
@@ -142,7 +102,6 @@ class OpenAIChatRequest(BaseModel):
     model: str = "qwen3-30b-a3b-instruct-2507"
     messages: List[OpenAIMessage]
     max_tokens: int = 2048
-    temperature: float = 0.7
     stream: bool = False
 
 class OpenAIChoice(BaseModel):
@@ -166,125 +125,46 @@ class OpenAIChatResponse(BaseModel):
 
 def _load_embedding():
     global embedding_tokenizer, embedding_model
-    print(f"📥 正在加载Embedding模型: {EMBEDDING_MODEL_PATH}")
-    
     embedding_tokenizer = AutoTokenizer.from_pretrained(EMBEDDING_MODEL_PATH)
-    embedding_model = AutoModel.from_pretrained(EMBEDDING_MODEL_PATH)
-    
-    # 移动到GPU
-    embedding_model = embedding_model.to(DEFAULT_DEVICE)
-    print(f"✅ Embedding模型已加载到: {next(embedding_model.parameters()).device}")
-    print(f"📊 模型数据类型: {next(embedding_model.parameters()).dtype}")
-    
-    embedding_model.eval()
+    embedding_model = AutoModel.from_pretrained(EMBEDDING_MODEL_PATH).to(CUDA_DEVICE).eval()
+    print("✅ Embedding模型加载完成")
 
 def _load_reranker():
     global reranker_tokenizer, reranker_model
-    print(f"📥 正在加载Reranker模型: {RERANKER_MODEL_PATH}")
-    
-    # 抑制BGE-reranker的pooler权重警告
     import warnings
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="Some weights of XLMRobertaModel were not initialized")
         reranker_tokenizer = AutoTokenizer.from_pretrained(RERANKER_MODEL_PATH)
-        reranker_model = AutoModel.from_pretrained(RERANKER_MODEL_PATH)
-    
-    # 移动到GPU
-    reranker_model = reranker_model.to(DEFAULT_DEVICE)
-    print(f"✅ Reranker模型已加载到: {next(reranker_model.parameters()).device}")
-    print(f"📊 模型数据类型: {next(reranker_model.parameters()).dtype}")
-    
-    reranker_model.eval()
+        reranker_model = AutoModel.from_pretrained(RERANKER_MODEL_PATH).to(CUDA_DEVICE).eval()
+    print("✅ Reranker模型加载完成")
 
 def _load_chat():
-    global chat_tokenizer, chat_model, langchain_llm, langchain_chat_model, chat_prompt_template
-    print(f"📥 正在加载Chat模型: {CHAT_MODEL_PATH}")
-    print("🔧 使用模型原生配置")
-    
+    global chat_tokenizer, chat_model
     chat_tokenizer = AutoTokenizer.from_pretrained(CHAT_MODEL_PATH)
     
-    # GPU设备映射配置
-    print("🎮 配置GPU设备映射...")
     gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-    print(f"💾 可用GPU显存: {gpu_memory_gb:.2f} GB")
-    print("📍 策略: 智能自动分配到GPU")
-    device_map = "auto"
+    torch.cuda.empty_cache()
     
-    # 加载模型，使用最简配置
-    print("🔄 开始调用 AutoModelForCausalLM.from_pretrained...")
-    print(f"📁 模型路径: {CHAT_MODEL_PATH}")
+    from transformers import BitsAndBytesConfig
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4"
+    )
     
-    import time
-    start_time = time.time()
+    chat_model = AutoModelForCausalLM.from_pretrained(
+        CHAT_MODEL_PATH,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        quantization_config=quantization_config,
+        max_memory={0: f"{int(gpu_memory_gb * 0.85)}GB"},
+        **(_get_attention_config())
+    ).eval()
     
-    try:
-        print("⏳ 正在实例化模型...")
-        torch.cuda.empty_cache()
-        print("🧹 清理GPU缓存")
-        
-        # 配置量化参数 - 使用新的BitsAndBytesConfig
-        from transformers import BitsAndBytesConfig
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4"
-        )
-        
-        chat_model = AutoModelForCausalLM.from_pretrained(
-            CHAT_MODEL_PATH,
-            trust_remote_code=True,
-            low_cpu_mem_usage=True,
-            torch_dtype=torch.float16,  # 使用float16获得更好性能
-            device_map=device_map,
-            quantization_config=quantization_config,  # 使用新的量化配置
-            max_memory={0: f"{int(gpu_memory_gb * 0.85)}GB"},  # 使用更多显存
-            offload_folder=None,
-            offload_state_dict=False,
-            # 智能选择注意力实现
-            **(_get_attention_config())
-        )
-        
-        end_time = time.time()
-        print(f"✅ 模型加载完成，耗时: {end_time - start_time:.2f} 秒")
-        
-        # 不需要手动移动到GPU，accelerate已经处理了
-        print("✅ 模型已通过accelerate自动映射到GPU")
-        
-        # 检查显存使用
-        _print_gpu_status()
-        
-        print("🔄 开始检查模型状态...")
-        
-    except Exception as e:
-        print(f"❌ 模型加载过程中出错: {e}")
-        import traceback
-        traceback.print_exc()
-        raise e
-    
-    
-    print("🔄 模型加载完成，开始后处理...")
-    chat_model.eval()
-    print("✅ 模型设置为评估模式")
-    
-    # 先打印基本的模型加载状态
-    print("✅ Chat模型已加载到设备")
-    print("📊 Chat模型设备分布:")
-    try:
-        if hasattr(chat_model, 'hf_device_map'):
-            device_map_items = list(chat_model.hf_device_map.items())[:5]  # 只显示前5个避免输出过多
-            for layer, device in device_map_items:
-                if isinstance(layer, str) and len(layer) > 50:
-                    layer = layer[:47] + "..."
-                print(f"   {layer}: {device}")
-            if len(chat_model.hf_device_map) > 5:
-                print(f"   ... 和其他 {len(chat_model.hf_device_map) - 5} 个层")
-        else:
-            print("   未找到设备映射信息")
-    except Exception as e:
-        print(f"   设备映射检查失败: {e}")
-    
-    print("✅ Chat模型基础加载完成 (NF4量化)")
+    print("✅ Chat模型加载完成 (NF4量化)")
 
 def _maybe_warmup():
     if os.getenv("CHAT_WARMUP", "0") != "1":
@@ -313,41 +193,25 @@ def _maybe_warmup():
 async def load_models():
     global embedding_tokenizer, embedding_model, reranker_tokenizer, reranker_model, chat_tokenizer, chat_model
     
-    print("🚀 启动BGE模型服务 - 单请求优化模式...")
-    print("=" * 60)
-    print(f"✅ GPU可用: {torch.cuda.get_device_name(0)}")
-    
     os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-    
     app.state.chat_config = {
-        "quant": "nf4",  # 使用NF4 4bit量化
-        "resolved_dtype": "float16",  # 使用float16获得更好性能
+        "quant": "nf4",
+        "resolved_dtype": "float16",
         "max_new_tokens_default": int(os.getenv("MAX_NEW_TOKENS", "512"))
     }
     
-    print("🎯 配置信息:")
-    print(f"   - 量化方式: {app.state.chat_config['quant']}")
-    print(f"   - 数据类型: {app.state.chat_config['resolved_dtype']}")
-    print(f"   - 默认最大Token: {app.state.chat_config['max_new_tokens_default']}")
-    
     try:
-        print("\n📦 开始加载模型...")
+        print("📦 模型加载中...")
         _load_embedding()
-        print()
         _load_reranker() 
-        print()
         _load_chat()
-        print()
         _maybe_warmup()
         
-        print("\n✅ 所有模型加载完成！")
         allocated = torch.cuda.memory_allocated(0) / (1024**3)
         total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        print(f"🎮 GPU显存使用: {allocated:.1f}GB / {total:.1f}GB ({allocated/total*100:.1f}%)")
-        print("=" * 60)
+        print(f"🎮 显存使用: {allocated:.1f}GB/{total:.1f}GB ({allocated/total*100:.1f}%)")
         
     except Exception as e:
-        print(f"❌ 模型加载错误: {e}")
         raise e  # 直接抛出异常，不要继续运行
 
 @app.get("/")
@@ -439,16 +303,12 @@ async def get_embeddings(request: TextRequest):
             return_tensors='pt'
         )
         
-        # 移动到模型设备
-        device = next(embedding_model.parameters()).device
-        encoded_input = {k: v.to(device, non_blocking=True) for k, v in encoded_input.items()}
+        # 移动到GPU
+        encoded_input = {k: v.to(CUDA_DEVICE, non_blocking=True) for k, v in encoded_input.items()}
         
-        # 优化推理
+        # GPU推理
         with torch.no_grad():
-            if torch.cuda.is_available():
-                with torch.amp.autocast('cuda', dtype=torch.float16):
-                    model_output = embedding_model(**encoded_input)
-            else:
+            with torch.amp.autocast('cuda', dtype=torch.float16):
                 model_output = embedding_model(**encoded_input)
             embeddings = model_output.last_hidden_state[:, 0].cpu().numpy()
         
@@ -463,7 +323,6 @@ async def rerank_documents(request: RerankRequest):
         raise HTTPException(status_code=500, detail="Reranker model not loaded")
     
     try:
-        device = next(reranker_model.parameters()).device
         scores = []
         
         # 批量处理所有文档对 - 单请求优化
@@ -478,15 +337,12 @@ async def rerank_documents(request: RerankRequest):
             return_tensors='pt'
         )
         
-        # 移动到设备
-        encoded_input = {k: v.to(device, non_blocking=True) for k, v in encoded_input.items()}
+        # 移动到GPU
+        encoded_input = {k: v.to(CUDA_DEVICE, non_blocking=True) for k, v in encoded_input.items()}
         
-        # 优化推理
+        # GPU推理
         with torch.no_grad():
-            if torch.cuda.is_available():
-                with torch.amp.autocast('cuda', dtype=torch.float16):
-                    outputs = reranker_model(**encoded_input)
-            else:
+            with torch.amp.autocast('cuda', dtype=torch.float16):
                 outputs = reranker_model(**encoded_input)
             
             # 批量计算相关性分数
@@ -498,30 +354,9 @@ async def rerank_documents(request: RerankRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing rerank request: {str(e)}")
 
-def _get_model_device(model):
-    """获取模型的设备"""
-    device = None
-    if torch.cuda.is_available():
-        try:
-            # 检查模型是否有device_map
-            if hasattr(model, 'hf_device_map'):
-                # 获取第一个可用设备
-                device = next(iter(model.hf_device_map.values()))
-                if isinstance(device, str):
-                    device = torch.device(device)
-                elif isinstance(device, int):
-                    device = torch.device(f"cuda:{device}")
-            else:
-                # 尝试从模型参数获取设备
-                device = next(p.device for p in model.parameters() if p.device.type != "meta")
-        except (StopIteration, AttributeError):
-            device = torch.device(DEFAULT_DEVICE)
-    else:
-        device = torch.device("cpu")
-    return device
 
-def _generate_with_model(model, tokenizer, input_ids, attention_mask, max_new_tokens, temperature, past_key_values=None):
-    """使用模型生成文本"""
+def _generate_with_model(model, tokenizer, input_ids, attention_mask, max_new_tokens, past_key_values=None):
+    """使用模型生成文本 - 业务场景使用贪婪解码确保确定性结果"""
     with torch.no_grad():
         with torch.amp.autocast('cuda'):
             outputs = model.generate(
@@ -529,27 +364,25 @@ def _generate_with_model(model, tokenizer, input_ids, attention_mask, max_new_to
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 max_new_tokens=max_new_tokens,
-                temperature=temperature if temperature > 0.1 else 0.1,
-                do_sample=temperature > 0.1,
+                do_sample=False,  # 贪婪解码，确定性结果
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 use_cache=True,
                 num_beams=1,
-                top_k=10 if temperature > 0.1 else None,
-                top_p=0.85 if temperature > 0.1 else None,
                 output_attentions=False,
                 output_hidden_states=False,
                 return_dict_in_generate=True
             )
     return outputs
 
-def _stream_generate_with_model(model, tokenizer, input_ids, attention_mask, max_new_tokens, temperature, past_key_values=None):
-    """优化的流式生成文本 - 使用transformers内置的流式生成"""
+def _stream_generate_with_model(model, tokenizer, input_ids, attention_mask, max_new_tokens, past_key_values=None):
+    """优化的流式生成文本 - 业务场景确定性结果"""
     import json
+    import threading
     import time
     import uuid
+
     from transformers import TextIteratorStreamer
-    import threading
 
     # 创建响应ID
     response_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -559,21 +392,18 @@ def _stream_generate_with_model(model, tokenizer, input_ids, attention_mask, max
         # 使用TextIteratorStreamer进行流式生成
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
         
-        # 高性能生成参数
+        # 业务场景生成参数 - 确定性结果
         generation_kwargs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "past_key_values": past_key_values,
             "max_new_tokens": max_new_tokens,
-            "temperature": temperature if temperature > 0.1 else 0.1,
-            "do_sample": temperature > 0.1,
+            "do_sample": False,  # 贪婪解码，确定性结果
             "pad_token_id": tokenizer.eos_token_id,
             "eos_token_id": tokenizer.eos_token_id,
             "use_cache": True,
             "streamer": streamer,
             "num_beams": 1,
-            "top_k": 10 if temperature > 0.1 else None,
-            "top_p": 0.85 if temperature > 0.1 else None,
             "output_attentions": False,
             "output_hidden_states": False,
             "output_scores": False,
@@ -708,10 +538,9 @@ async def openai_chat_completion(request: OpenAIChatRequest):
             max_length=4096
         )
         
-        # 获取设备并移动数据
-        device = _get_model_device(chat_model)
-        input_ids = encoded["input_ids"].to(device, non_blocking=True)
-        attention_mask = encoded["attention_mask"].to(device, non_blocking=True)
+        # 移动数据到GPU
+        input_ids = encoded["input_ids"].to(CUDA_DEVICE, non_blocking=True)
+        attention_mask = encoded["attention_mask"].to(CUDA_DEVICE, non_blocking=True)
         
         # 根据stream参数选择流式或非流式
         if request.stream:
@@ -720,11 +549,10 @@ async def openai_chat_completion(request: OpenAIChatRequest):
                 try:
                     for chunk in _stream_generate_with_model(
                         chat_model, chat_tokenizer, input_ids, attention_mask,
-                        request.max_tokens, request.temperature, past_key_values
+                        request.max_tokens, past_key_values
                     ):
                         yield chunk
                 except Exception as e:
-                    print(f"❌ 流式生成错误: {e}")
                     yield f"data: {{'error': '{str(e)}'}}\n\n"
             
             return StreamingResponse(
@@ -740,7 +568,7 @@ async def openai_chat_completion(request: OpenAIChatRequest):
             # 非流式响应
             outputs = _generate_with_model(
                 chat_model, chat_tokenizer, input_ids, attention_mask,
-                request.max_tokens, request.temperature, past_key_values
+                request.max_tokens, past_key_values
             )
             
             # 解码输出
@@ -789,20 +617,9 @@ async def openai_chat_completion(request: OpenAIChatRequest):
             )
         
     except Exception as e:
-        print(f"❌ OpenAI兼容API调用失败: {e}")
         torch.cuda.empty_cache()
         raise HTTPException(status_code=500, detail=f"Error processing OpenAI chat request: {str(e)}")
 
 if __name__ == "__main__":
-    print("🌟 启动BGE模型服务器")
-    print("🎮 GPU检查:")
-    _print_gpu_status()
-    
     import uvicorn
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=8000,
-        log_level="info",
-        access_log=True
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
